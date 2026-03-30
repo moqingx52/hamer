@@ -87,6 +87,87 @@ python demo.py \
   --body_detector regnety
 ```
 
+### 4. 完整测试实例：`test/add_remove_lid/0.mp4`（抽帧 → HaMeR → 校验 → 合成视频）
+
+以下均在 **hamer 仓库根目录**（与 `demo.py` 同级）执行。假设视频与数据位于 `test/add_remove_lid/`（与 EgoDex `test.zip` 中目录一致）；若路径不同，替换环境变量或路径即可。
+
+**目录约定**
+
+| 路径 | 用途 |
+|------|------|
+| `test/add_remove_lid/0.mp4` | 输入视频 |
+| `test/add_remove_lid/frames_0/` | 抽帧输出（`%06d.jpg`） |
+| `test/add_remove_lid/hamer_out_0/` | `demo.py` 输出（渲染图、`*_all.jpg`、`hamer_structured_results.json`） |
+
+**（可选）用同目录 HDF5 写入相机内参**，再跑 demo（深度/全图相机更一致时建议做）：
+
+```bash
+python scripts/apply_intrinsics_from_hdf5.py --hdf5 test/add_remove_lid/0.hdf5
+```
+
+**1）视频 → 有序帧**
+
+```bash
+mkdir -p test/add_remove_lid/frames_0
+ffmpeg -y -i test/add_remove_lid/0.mp4 -q:v 2 test/add_remove_lid/frames_0/%06d.jpg
+```
+
+**2）HaMeR 推理 + 结构化 JSON**（`--assume_fps 30` 与 EgoDex RGB 帧率一致，便于 JSON 里带时间戳）
+
+```bash
+python demo.py \
+  --img_folder test/add_remove_lid/frames_0 \
+  --out_folder test/add_remove_lid/hamer_out_0 \
+  --file_type "*.jpg" \
+  --batch_size 8 \
+  --full_frame \
+  --assume_fps 30 \
+  --structured_file hamer_structured_results.json
+```
+
+显式指定 EgoDex 内参时（未跑上面的 `apply_intrinsics` 时，可把下面数值换成你从 HDF5 读出的 fx/fy/cx/cy）：
+
+```bash
+python demo.py \
+  --img_folder test/add_remove_lid/frames_0 \
+  --out_folder test/add_remove_lid/hamer_out_0 \
+  --file_type "*.jpg" \
+  --batch_size 8 \
+  --full_frame \
+  --assume_fps 30 \
+  --structured_file hamer_structured_results.json \
+  --camera_fx <fx> --camera_fy <fy> --camera_cx <cx> --camera_cy <cy>
+```
+
+**3）校验结构化输出**（重投影与统计；`--error_vis_dir` 会导出若干最差样本可视化）
+
+```bash
+python validate_hamer_output.py \
+  --structured_json test/add_remove_lid/hamer_out_0/hamer_structured_results.json \
+  --report_json test/add_remove_lid/hamer_out_0/validation_report.json \
+  --error_vis_dir test/add_remove_lid/hamer_out_0/validation_vis \
+  --max_vis 10
+```
+
+**4）全图叠加结果 → 视频**（`demo.py` 在开启 `--full_frame` 时为每一帧写入 `帧序号_all.jpg`，与抽帧的 `%06d.jpg`  stem 一致）
+
+```bash
+ffmpeg -y -framerate 30 -i test/add_remove_lid/hamer_out_0/%06d_all.jpg \
+  -c:v libx264 -pix_fmt yuv420p test/add_remove_lid/hamer_out_0/hamer_overlay_30fps.mp4
+```
+
+**Windows PowerShell 一行版参考**（路径同上时）：
+
+```powershell
+New-Item -ItemType Directory -Force test/add_remove_lid/frames_0 | Out-Null
+ffmpeg -y -i test/add_remove_lid/0.mp4 -q:v 2 "test/add_remove_lid/frames_0/%06d.jpg"
+python demo.py --img_folder test/add_remove_lid/frames_0 --out_folder test/add_remove_lid/hamer_out_0 --file_type "*.jpg" --batch_size 8 --full_frame --assume_fps 30 --structured_file hamer_structured_results.json
+python validate_hamer_output.py --structured_json test/add_remove_lid/hamer_out_0/hamer_structured_results.json --report_json test/add_remove_lid/hamer_out_0/validation_report.json --error_vis_dir test/add_remove_lid/hamer_out_0/validation_vis --max_vis 10
+ffmpeg -y -framerate 30 -i "test/add_remove_lid/hamer_out_0/%06d_all.jpg" -c:v libx264 -pix_fmt yuv420p test/add_remove_lid/hamer_out_0/hamer_overlay_30fps.mp4
+```
+
+**说明**：若某帧未检测到人手，可能没有对应的 `*_all.jpg`，会导致第 4 步 `ffmpeg` 序列中断。可先用短片段测试，或对缺失帧做补帧/改脚本（本实例以标准连续检测为前提）。
+
 ---
 
 ## 四、核心功能：HaMeR 能输出什么？
