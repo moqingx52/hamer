@@ -165,6 +165,37 @@ class TemporalSmoother:
         self.prev_betas = None
 
 
+class FingerKeypointWindowSmoother:
+    """
+    Sliding-window smoother for finger keypoints only.
+    Keeps wrist (index 0) unchanged and smooths finger joints (index 1..20).
+    """
+
+    def __init__(self, window_size=30):
+        self.window_size = max(1, int(window_size))
+        self.history_by_track = {}
+
+    def update(self, track_id: str, keypoints_3d_local: np.ndarray) -> np.ndarray:
+        kp = np.asarray(keypoints_3d_local, dtype=np.float64)
+        if kp.ndim != 2 or kp.shape[0] < 2 or kp.shape[1] != 3:
+            # Return as-is if not in expected format [N, 3]
+            return keypoints_3d_local
+
+        if track_id not in self.history_by_track:
+            self.history_by_track[track_id] = deque(maxlen=self.window_size)
+        hist = self.history_by_track[track_id]
+        hist.append(kp.copy())
+
+        if len(hist) == 1:
+            return kp
+
+        stacked = np.stack(hist, axis=0)  # [T, N, 3]
+        kp_smooth = kp.copy()
+        # Keep wrist (index 0) unchanged, smooth finger joints (index 1..N-1)
+        kp_smooth[1:] = stacked[:, 1:, :].mean(axis=0)
+        return kp_smooth
+
+
 def _wrist_pose_cam_to_base(
     p_cam: np.ndarray, R_cam: np.ndarray, T_cam2base: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -270,6 +301,8 @@ def main():
                         help='Smoothing factor for exponential moving average (0-1, lower=smoother, default=0.3)')
     parser.add_argument('--min_det_score', type=float, default=0.5,
                         help='Minimum detection score to include in smoothing (default=0.5)')
+    parser.add_argument('--finger_smooth_window', type=int, default=30,
+                        help='Sliding window size (frames) for finger-only smoothing on keypoints_3d_local (default=30)')
 
     args = parser.parse_args()
 
@@ -310,6 +343,11 @@ def main():
         except ImportError:
             print('Warning: scipy not available, disabling temporal smoothing')
             args.temporal_smoothing = False
+
+    finger_window_smoother = None
+    if args.finger_smooth_window > 1:
+        finger_window_smoother = FingerKeypointWindowSmoother(window_size=args.finger_smooth_window)
+        print(f'Finger-only sliding window smoothing enabled (window={args.finger_smooth_window} frames)')
 
     # Download and load checkpoints
     download_models(CACHE_DIR_HAMER)
@@ -494,7 +532,7 @@ def main():
                     R_wrist_cam = np.asarray(global_orient[0], dtype=np.float64)
                     hand_side = 'right' if int(is_right) == 1 else 'left'
                     
-                    # Apply temporal smoothing
+                    # Apply temporal smoothing (EMA) to MANO parameters and wrist pose
                     if smoother is not None:
                         p_wrist_cam, R_wrist_cam, cam_t_smooth, global_orient_smooth, hand_pose_smooth, betas_smooth = \
                             smoother.update(
@@ -519,6 +557,12 @@ def main():
                         p_wrist_base, R_wrist_base = _wrist_pose_cam_to_base(
                             p_wrist_cam, R_wrist_cam, T_cam2base
                         )
+
+                    # Apply sliding-window smoothing to finger keypoints only (in wrist-local frame)
+                    # This runs AFTER EMA smoothing to avoid double-smoothing the wrist
+                    if finger_window_smoother is not None:
+                        track_id = f'{hand_side}_{hand_det_id}'
+                        keypoints_3d = finger_window_smoother.update(track_id, keypoints_3d)
                     
                     # keypoints_3d_local: OpenPose 21 keypoints in wrist-local frame
                     keypoints_3d_local = keypoints_3d.tolist()
