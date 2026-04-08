@@ -167,33 +167,54 @@ class TemporalSmoother:
 
 class FingerKeypointWindowSmoother:
     """
-    Sliding-window smoother for finger keypoints only.
+    Sliding time-window smoother for finger keypoints only.
     Keeps wrist (index 0) unchanged and smooths finger joints (index 1..20).
+
+    The window is measured in source-frame units instead of processed-image count,
+    so discontinuous image sequences can still use a meaningful temporal window.
     """
 
     def __init__(self, window_size=30):
         self.window_size = max(1, int(window_size))
         self.history_by_track = {}
 
-    def update(self, track_id: str, keypoints_3d_local: np.ndarray) -> np.ndarray:
+    def update(self, track_id: str, frame_value: int, keypoints_3d_local: np.ndarray) -> np.ndarray:
         kp = np.asarray(keypoints_3d_local, dtype=np.float64)
         if kp.ndim != 2 or kp.shape[0] < 2 or kp.shape[1] != 3:
             # Return as-is if not in expected format [N, 3]
             return keypoints_3d_local
 
         if track_id not in self.history_by_track:
-            self.history_by_track[track_id] = deque(maxlen=self.window_size)
+            self.history_by_track[track_id] = deque()
         hist = self.history_by_track[track_id]
-        hist.append(kp.copy())
+        hist.append((int(frame_value), kp.copy()))
+
+        min_frame_value = int(frame_value) - self.window_size + 1
+        while hist and hist[0][0] < min_frame_value:
+            hist.popleft()
 
         if len(hist) == 1:
             return kp
 
-        stacked = np.stack(hist, axis=0)  # [T, N, 3]
+        stacked = np.stack([entry[1] for entry in hist], axis=0)  # [T, N, 3]
         kp_smooth = kp.copy()
         # Keep wrist (index 0) unchanged, smooth finger joints (index 1..N-1)
         kp_smooth[1:] = stacked[:, 1:, :].mean(axis=0)
         return kp_smooth
+
+
+def _extract_frame_value(path: Path, fallback_idx: int) -> int:
+    """
+    Extract an integer frame id from the image filename.
+
+    For discontinuous image inputs, using the filename-derived frame id keeps the
+    sliding window aligned to the original timeline when names contain frame numbers
+    such as frame_000123.jpg. If no digits are present, fall back to enumerate index.
+    """
+    matches = re.findall(r'\d+', path.stem)
+    if not matches:
+        return int(fallback_idx)
+    return int(matches[-1])
 
 
 def _wrist_pose_cam_to_base(
@@ -302,7 +323,7 @@ def main():
     parser.add_argument('--min_det_score', type=float, default=0.5,
                         help='Minimum detection score to include in smoothing (default=0.5)')
     parser.add_argument('--finger_smooth_window', type=int, default=30,
-                        help='Sliding window size (frames) for finger-only smoothing on keypoints_3d_local (default=30)')
+                        help='Sliding time window size for finger-only smoothing on keypoints_3d_local (default=30 frame units)')
 
     args = parser.parse_args()
 
@@ -347,7 +368,7 @@ def main():
     finger_window_smoother = None
     if args.finger_smooth_window > 1:
         finger_window_smoother = FingerKeypointWindowSmoother(window_size=args.finger_smooth_window)
-        print(f'Finger-only sliding window smoothing enabled (window={args.finger_smooth_window} frames)')
+        print(f'Finger-only sliding time-window smoothing enabled (window={args.finger_smooth_window} frame units)')
 
     # Download and load checkpoints
     download_models(CACHE_DIR_HAMER)
@@ -393,6 +414,7 @@ def main():
 
     # Iterate over all images in folder
     for frame_idx, img_path in enumerate(img_paths):
+        frame_value = _extract_frame_value(img_path, frame_idx)
         img_cv2 = cv2.imread(str(img_path))
 
         # Detect humans in image
@@ -562,7 +584,7 @@ def main():
                     # This runs AFTER EMA smoothing to avoid double-smoothing the wrist
                     if finger_window_smoother is not None:
                         track_id = f'{hand_side}_{hand_det_id}'
-                        keypoints_3d = finger_window_smoother.update(track_id, keypoints_3d)
+                        keypoints_3d = finger_window_smoother.update(track_id, frame_value, keypoints_3d)
                     
                     # keypoints_3d_local: OpenPose 21 keypoints in wrist-local frame
                     keypoints_3d_local = keypoints_3d.tolist()
