@@ -18,6 +18,151 @@ from vitpose_model import ViTPoseModel
 import json
 from typing import Dict, Optional, Tuple
 import re
+from collections import deque
+
+
+class TemporalSmoother:
+    """
+    Exponential Moving Average (EMA) smoother for hand pose sequences.
+    Smooths position, rotation, and MANO parameters across frames.
+    """
+    
+    def __init__(self, alpha=0.3, min_score=0.5):
+        """
+        Args:
+            alpha: Smoothing factor (0-1). Lower = smoother but more lag.
+            min_score: Minimum detection score to update the smoother.
+        """
+        self.alpha = alpha
+        self.min_score = min_score
+        self.prev_p_wrist = None
+        self.prev_R_wrist = None
+        self.prev_cam_t = None
+        self.prev_global_orient = None
+        self.prev_hand_pose = None
+        self.prev_betas = None
+        self.initialized = False
+    
+    def smooth_rotation_matrix(self, R_new, R_prev):
+        """
+        Smooth rotation matrices using quaternion slerp approximation.
+        Convert to axis-angle, interpolate, convert back.
+        """
+        from scipy.spatial.transform import Rotation as R_scipy
+        
+        # Convert rotation matrices to quaternions
+        quat_new = R_scipy.from_matrix(R_new).as_quat()
+        quat_prev = R_scipy.from_matrix(R_prev).as_quat()
+        
+        # Ensure shortest path (quaternion sign ambiguity)
+        if np.dot(quat_new, quat_prev) < 0:
+            quat_new = -quat_new
+        
+        # Slerp interpolation
+        t = self.alpha
+        # Simple lerp for small angles (good enough for consecutive frames)
+        quat_smooth = (1 - t) * quat_prev + t * quat_new
+        quat_smooth = quat_smooth / (np.linalg.norm(quat_smooth) + 1e-8)
+        
+        # Convert back to rotation matrix
+        R_smooth = R_scipy.from_quat(quat_smooth).as_matrix()
+        return R_smooth.astype(np.float64)
+    
+    def smooth_vector(self, v_new, v_prev):
+        """Simple EMA for vectors."""
+        return self.alpha * v_new + (1 - self.alpha) * v_prev
+    
+    def update(self, p_wrist, R_wrist, cam_t, global_orient, hand_pose, betas, score=None):
+        """
+        Update smoother with new frame data.
+        
+        Args:
+            p_wrist: wrist position (3,)
+            R_wrist: wrist rotation (3,3)
+            cam_t: camera translation (3,)
+            global_orient: MANO global orientation (1,3,3) or (3,3)
+            hand_pose: MANO hand pose parameters
+            betas: MANO shape parameters
+            score: detection confidence (optional)
+            
+        Returns:
+            Smoothed values (same format as inputs)
+        """
+        # Skip smoothing if score is too low
+        if score is not None and score < self.min_score:
+            return p_wrist, R_wrist, cam_t, global_orient, hand_pose, betas
+        
+        if not self.initialized:
+            # First frame: initialize
+            self.prev_p_wrist = p_wrist.copy()
+            self.prev_R_wrist = R_wrist.copy()
+            self.prev_cam_t = cam_t.copy()
+            self.prev_global_orient = global_orient.copy()
+            self.prev_hand_pose = hand_pose.copy()
+            self.prev_betas = betas.copy()
+            self.initialized = True
+            return p_wrist, R_wrist, cam_t, global_orient, hand_pose, betas
+        
+        # Smooth position
+        p_wrist_smooth = self.smooth_vector(p_wrist, self.prev_p_wrist)
+        
+        # Smooth camera translation
+        cam_t_smooth = self.smooth_vector(cam_t, self.prev_cam_t)
+        
+        # Smooth rotation (wrist)
+        R_wrist_smooth = self.smooth_rotation_matrix(R_wrist, self.prev_R_wrist)
+        
+        # Smooth global orientation (rotation matrix)
+        go_shape = global_orient.shape
+        global_orient_reshaped = global_orient.reshape(-1, 3, 3)
+        prev_go_reshaped = self.prev_global_orient.reshape(-1, 3, 3)
+        global_orient_smooth_list = []
+        for i in range(global_orient_reshaped.shape[0]):
+            R_smooth = self.smooth_rotation_matrix(
+                global_orient_reshaped[i], prev_go_reshaped[i]
+            )
+            global_orient_smooth_list.append(R_smooth)
+        global_orient_smooth = np.stack(global_orient_smooth_list).reshape(go_shape)
+        
+        # Smooth hand pose (assuming it's already in rotation matrix format)
+        hp_shape = hand_pose.shape
+        if len(hp_shape) >= 2 and hp_shape[-2:] == (3, 3):
+            # It's rotation matrices
+            hand_pose_reshaped = hand_pose.reshape(-1, 3, 3)
+            prev_hp_reshaped = self.prev_hand_pose.reshape(-1, 3, 3)
+            hand_pose_smooth_list = []
+            for i in range(hand_pose_reshaped.shape[0]):
+                R_smooth = self.smooth_rotation_matrix(
+                    hand_pose_reshaped[i], prev_hp_reshaped[i]
+                )
+                hand_pose_smooth_list.append(R_smooth)
+            hand_pose_smooth = np.stack(hand_pose_smooth_list).reshape(hp_shape)
+        else:
+            # It's a vector (e.g., axis-angle), use simple EMA
+            hand_pose_smooth = self.smooth_vector(hand_pose, self.prev_hand_pose)
+        
+        # Smooth betas (simple EMA)
+        betas_smooth = self.smooth_vector(betas, self.prev_betas)
+        
+        # Update state
+        self.prev_p_wrist = p_wrist_smooth.copy()
+        self.prev_R_wrist = R_wrist_smooth.copy()
+        self.prev_cam_t = cam_t_smooth.copy()
+        self.prev_global_orient = global_orient_smooth.copy()
+        self.prev_hand_pose = hand_pose_smooth.copy()
+        self.prev_betas = betas_smooth.copy()
+        
+        return p_wrist_smooth, R_wrist_smooth, cam_t_smooth, global_orient_smooth, hand_pose_smooth, betas_smooth
+    
+    def reset(self):
+        """Reset smoother state (e.g., when switching subjects)."""
+        self.initialized = False
+        self.prev_p_wrist = None
+        self.prev_R_wrist = None
+        self.prev_cam_t = None
+        self.prev_global_orient = None
+        self.prev_hand_pose = None
+        self.prev_betas = None
 
 
 def _wrist_pose_cam_to_base(
@@ -117,6 +262,14 @@ def main():
                         help='If set, add timestamp_sec = frame_idx / assume_fps for image sequences')
     parser.add_argument('--cam2base_json', type=str, default=None,
                         help='Optional path to JSON with 4x4 "T_cam2base" (camera->robot base) to export p_wrist_base / R_wrist_base')
+    parser.add_argument('--temporal_smoothing', dest='temporal_smoothing', action='store_true', default=True,
+                        help='Enable temporal smoothing for video sequences (default: enabled)')
+    parser.add_argument('--no_temporal_smoothing', dest='temporal_smoothing', action='store_false',
+                        help='Disable temporal smoothing')
+    parser.add_argument('--smoothing_alpha', type=float, default=0.3,
+                        help='Smoothing factor for exponential moving average (0-1, lower=smoother, default=0.3)')
+    parser.add_argument('--min_det_score', type=float, default=0.5,
+                        help='Minimum detection score to include in smoothing (default=0.5)')
 
     args = parser.parse_args()
 
@@ -146,6 +299,17 @@ def main():
         T_cam2base = np.asarray(_extr['T_cam2base'], dtype=np.float64)
         if T_cam2base.shape != (4, 4):
             raise ValueError('cam2base JSON must contain T_cam2base as a 4x4 matrix')
+    
+    # Initialize temporal smoother
+    smoother = None
+    if args.temporal_smoothing:
+        try:
+            from scipy.spatial.transform import Rotation as R_scipy
+            smoother = TemporalSmoother(alpha=args.smoothing_alpha, min_score=args.min_det_score)
+            print(f'Temporal smoothing enabled (alpha={args.smoothing_alpha}, min_score={args.min_det_score})')
+        except ImportError:
+            print('Warning: scipy not available, disabling temporal smoothing')
+            args.temporal_smoothing = False
 
     # Download and load checkpoints
     download_models(CACHE_DIR_HAMER)
@@ -323,84 +487,51 @@ def main():
                     hand_det_id = int(person_id)
                     person_score = None
                     if hand_det_id < len(hand_scores):
-                        person_score = hand_scores[hand_det_id]
-                    keypoints_2d = None
-                    bbox_xyxy = None
-                    if hand_det_id < len(hand_keypoints_2d):
-                        keypoints_2d = hand_keypoints_2d[hand_det_id].tolist()
-                    if hand_det_id < len(bboxes):
-                        bbox_xyxy = [float(v) for v in bboxes[hand_det_id]]
-                    Z = np.clip(keypoints_3d_cam[:, 2], 1e-8, None)
-                    keypoints_2d_reprojected = np.stack([
-                        fx * keypoints_3d_cam[:, 0] / Z + cx,
-                        fy * keypoints_3d_cam[:, 1] / Z + cy,
-                    ], axis=-1)
-                    reproj_stats = None
-                    if keypoints_2d is not None:
-                        kp2d_np = np.asarray(keypoints_2d, dtype=np.float32)
-                        vis = kp2d_np[:, 2] > 0.1 if kp2d_np.shape[1] > 2 else np.ones((kp2d_np.shape[0],), dtype=bool)
-                        if np.any(vis):
-                            err = np.linalg.norm(keypoints_2d_reprojected[vis] - kp2d_np[vis, :2], axis=1)
-                            reproj_stats = {
-                                'mean_px': float(np.mean(err)),
-                                'median_px': float(np.median(err)),
-                                'p95_px': float(np.percentile(err, 95)),
-                            }
-                    # OpenPose-mapped joint 0 = wrist; geometry already mirrored on x for left hands (see verts/keypoints).
+                        person_score = float(hand_scores[hand_det_id])
+                    
+                    # Wrist pose in camera frame (meters / HaMeR weak-perspective scale); R from MANO global_orient.
                     p_wrist_cam = np.asarray(keypoints_3d_cam[0], dtype=np.float64)
                     R_wrist_cam = np.asarray(global_orient[0], dtype=np.float64)
                     hand_side = 'right' if int(is_right) == 1 else 'left'
-                    ts = {
-                        'frame_idx': int(frame_idx),
-                        'image_stem': img_fn,
-                    }
-                    if args.assume_fps is not None:
-                        ts['timestamp_sec'] = float(frame_idx) / float(args.assume_fps)
-
-                    p_wrist_base = R_wrist_base = None
+                    
+                    # Apply temporal smoothing
+                    if smoother is not None:
+                        p_wrist_cam, R_wrist_cam, cam_t_smooth, global_orient_smooth, hand_pose_smooth, betas_smooth = \
+                            smoother.update(
+                                p_wrist_cam, R_wrist_cam, cam_t,
+                                global_orient, hand_pose, betas,
+                                score=person_score
+                            )
+                        # Use smoothed values
+                        cam_t = cam_t_smooth
+                        global_orient = global_orient_smooth
+                        hand_pose = hand_pose_smooth
+                        betas = betas_smooth
+                        # Update keypoints based on smoothed wrist position
+                        wrist_delta = p_wrist_cam - keypoints_3d_cam[0]
+                        keypoints_3d_cam = keypoints_3d_cam + wrist_delta[None, :]
+                        keypoints_3d = keypoints_3d_cam - cam_t[None, :]
+                    
+                    # Convert to IsaacLab-compatible format with wrist in device/base frame
+                    p_wrist_base = p_wrist_cam.copy()
+                    R_wrist_base = R_wrist_cam.copy()
                     if T_cam2base is not None:
                         p_wrist_base, R_wrist_base = _wrist_pose_cam_to_base(
                             p_wrist_cam, R_wrist_cam, T_cam2base
                         )
-
+                    
+                    # keypoints_3d_local: OpenPose 21 keypoints in wrist-local frame
+                    keypoints_3d_local = keypoints_3d.tolist()
+                    
+                    # Build minimal IsaacLab-compatible record
                     record = {
                         'frame_idx': int(frame_idx),
-                        'img_fn': img_fn,
-                        'image_path': str(img_path),
-                        'person_id': int(person_id),
-                        'is_right': int(is_right),
                         'hand_side': hand_side,
-                        'timestamp': ts,
-                        # Wrist pose in camera frame (meters / HaMeR weak-perspective scale); R from MANO global_orient.
-                        'p_wrist': p_wrist_cam.tolist(),
-                        'R_wrist': R_wrist_cam.tolist(),
-                        'score': person_score,
-                        'bbox_xyxy': bbox_xyxy,
-                        'hand_keypoints_2d': keypoints_2d,
-                        'img_width': int(round(img_w)),
-                        'img_height': int(round(img_h)),
-                        'focal_length_px': [fx, fy],
-                        'camera_center_px': [cx, cy],
-                        'camera_K': [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-                        'focal_for_cam_t': focal_for_cam_t,
-                        'focal_default_demo': default_focal,
-                        'pred_cam': out['pred_cam'][n].detach().cpu().numpy().tolist(),
-                        'pred_cam_t': out['pred_cam_t'][n].detach().cpu().numpy().tolist(),
-                        'pred_cam_t_full': cam_t.tolist(),
-                        'global_orient': global_orient.tolist(),
-                        'hand_pose': hand_pose.tolist(),
-                        'betas': betas.tolist(),
-                        'keypoints_3d_local': keypoints_3d.tolist(),
-                        'keypoints_3d_cam': keypoints_3d_cam.tolist(),
-                        'vertices_local': verts.tolist(),
-                        'vertices_cam': verts_cam.tolist(),
+                        'score': person_score if person_score is not None else 1.0,
+                        'p_wrist_base': p_wrist_base.tolist(),
+                        'R_wrist_base': R_wrist_base.tolist(),
+                        'keypoints_3d_local': keypoints_3d_local,
                     }
-                    if p_wrist_base is not None:
-                        record['p_wrist_base'] = p_wrist_base.tolist()
-                        record['R_wrist_base'] = R_wrist_base.tolist()
-                    if args.structured_debug:
-                        record['keypoints_2d_reprojected'] = keypoints_2d_reprojected.tolist()
-                        record['reprojection_stats'] = reproj_stats
                     structured_results.append(record)
 
                 # Save all meshes to disk
@@ -427,9 +558,11 @@ def main():
 
     if args.save_structured:
         structured_path = os.path.join(args.out_folder, args.structured_file)
+        # Wrap in "frames" key for IsaacLab compatibility (matching HOT3D adapter format)
+        output_data = {'frames': structured_results}
         with open(structured_path, 'w', encoding='utf-8') as f:
-            json.dump(structured_results, f, indent=2)
-        print(f'Saved structured predictions to {structured_path}')
+            json.dump(output_data, f, indent=2)
+        print(f'Saved structured predictions to {structured_path} ({len(structured_results)} frames)')
 
 if __name__ == '__main__':
     main()
