@@ -1,0 +1,4 @@
+Camera1.fx: 511.883062
+Camera1.fy: 511.790371
+Camera1.cx: 1081.052472
+Camera1.cy: 1081.141909

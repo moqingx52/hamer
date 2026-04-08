@@ -17,6 +17,7 @@ from vitpose_model import ViTPoseModel
 
 import json
 from typing import Dict, Optional, Tuple
+import re
 
 
 def _wrist_pose_cam_to_base(
@@ -28,6 +29,57 @@ def _wrist_pose_cam_to_base(
     p_base = R_cb @ p_cam + t_cb
     R_base = R_cb @ R_cam
     return p_base, R_base
+
+
+def _parse_intrinsics_file(path: str) -> Dict[str, float]:
+    """
+    Parse camera intrinsics from a text file.
+
+    Supported examples:
+      Camera1.fx: 511.883062
+      Camera1.fy: 511.790371
+      Camera1.cx: 1081.052472
+      Camera1.cy: 1081.141909
+
+    Also supports lines like:
+      fx=511.88
+      fy: 511.79
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f'Intrinsics file not found: {p}')
+
+    text = p.read_text(encoding='utf-8', errors='ignore')
+    # Match optionally prefixed "CameraX." then one of fx/fy/cx/cy then ":" or "=" then a float.
+    pattern = re.compile(
+        r'(?im)^\s*(?:[A-Za-z0-9_]+\.)?\s*(fx|fy|cx|cy)\s*[:=]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$'
+    )
+    values: Dict[str, float] = {}
+    for m in pattern.finditer(text):
+        k = m.group(1).lower()
+        v = float(m.group(2))
+        values[k] = v
+
+    missing = [k for k in ('fx', 'fy', 'cx', 'cy') if k not in values]
+    if missing:
+        raise ValueError(
+            f'Intrinsics file is missing keys: {missing}. '
+            f'Expected lines like "Camera1.fx: 511.883062". File: {p}'
+        )
+    return values
+
+
+def _write_camera_json(path: str, fx: float, fy: float, cx: float, cy: float) -> None:
+    outp = Path(path)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'fx': float(fx),
+        'fy': float(fy),
+        'cx': float(cx),
+        'cy': float(cy),
+        'K': [[float(fx), 0.0, float(cx)], [0.0, float(fy), float(cy)], [0.0, 0.0, 1.0]],
+    }
+    outp.write_text(json.dumps(payload, indent=2), encoding='utf-8')
 
 
 def main():
@@ -55,12 +107,37 @@ def main():
     parser.add_argument('--camera_fy', type=float, default=None, help='Override camera fy in pixels for structured projection')
     parser.add_argument('--camera_cx', type=float, default=None, help='Override camera cx in pixels for structured projection')
     parser.add_argument('--camera_cy', type=float, default=None, help='Override camera cy in pixels for structured projection')
+    parser.add_argument('--intrinsics_file', type=str, default=None,
+                        help='Optional path to a text file containing fx/fy/cx/cy (e.g. "Camera1.fx: 511.88"). '
+                             'If set, overrides --camera_fx/fy/cx/cy unless those are explicitly provided.')
+    parser.add_argument('--camera_json_out', type=str, default=None,
+                        help='If set, write the effective intrinsics (fx/fy/cx/cy) to this JSON path. '
+                             'Default: write to hamer/camera.json when --intrinsics_file is provided.')
     parser.add_argument('--assume_fps', type=float, default=None,
                         help='If set, add timestamp_sec = frame_idx / assume_fps for image sequences')
     parser.add_argument('--cam2base_json', type=str, default=None,
                         help='Optional path to JSON with 4x4 "T_cam2base" (camera->robot base) to export p_wrist_base / R_wrist_base')
 
     args = parser.parse_args()
+
+    intr_from_file: Optional[Dict[str, float]] = None
+    if args.intrinsics_file is not None:
+        intr_from_file = _parse_intrinsics_file(args.intrinsics_file)
+        # Only override CLI values if they were not explicitly provided.
+        if args.camera_fx is None:
+            args.camera_fx = intr_from_file['fx']
+        if args.camera_fy is None:
+            args.camera_fy = intr_from_file['fy']
+        if args.camera_cx is None:
+            args.camera_cx = intr_from_file['cx']
+        if args.camera_cy is None:
+            args.camera_cy = intr_from_file['cy']
+
+        camera_json_out = args.camera_json_out
+        if camera_json_out is None:
+            camera_json_out = str((Path(__file__).resolve().parent / 'camera.json'))
+        _write_camera_json(camera_json_out, args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy)
+        print(f'Wrote camera intrinsics to {camera_json_out}')
 
     T_cam2base = None
     if args.cam2base_json is not None:
