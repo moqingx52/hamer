@@ -323,84 +323,33 @@ def main():
                     hand_det_id = int(person_id)
                     person_score = None
                     if hand_det_id < len(hand_scores):
-                        person_score = hand_scores[hand_det_id]
-                    keypoints_2d = None
-                    bbox_xyxy = None
-                    if hand_det_id < len(hand_keypoints_2d):
-                        keypoints_2d = hand_keypoints_2d[hand_det_id].tolist()
-                    if hand_det_id < len(bboxes):
-                        bbox_xyxy = [float(v) for v in bboxes[hand_det_id]]
-                    Z = np.clip(keypoints_3d_cam[:, 2], 1e-8, None)
-                    keypoints_2d_reprojected = np.stack([
-                        fx * keypoints_3d_cam[:, 0] / Z + cx,
-                        fy * keypoints_3d_cam[:, 1] / Z + cy,
-                    ], axis=-1)
-                    reproj_stats = None
-                    if keypoints_2d is not None:
-                        kp2d_np = np.asarray(keypoints_2d, dtype=np.float32)
-                        vis = kp2d_np[:, 2] > 0.1 if kp2d_np.shape[1] > 2 else np.ones((kp2d_np.shape[0],), dtype=bool)
-                        if np.any(vis):
-                            err = np.linalg.norm(keypoints_2d_reprojected[vis] - kp2d_np[vis, :2], axis=1)
-                            reproj_stats = {
-                                'mean_px': float(np.mean(err)),
-                                'median_px': float(np.median(err)),
-                                'p95_px': float(np.percentile(err, 95)),
-                            }
-                    # OpenPose-mapped joint 0 = wrist; geometry already mirrored on x for left hands (see verts/keypoints).
+                        person_score = float(hand_scores[hand_det_id])
+                    
+                    # Wrist pose in camera frame (meters / HaMeR weak-perspective scale); R from MANO global_orient.
                     p_wrist_cam = np.asarray(keypoints_3d_cam[0], dtype=np.float64)
                     R_wrist_cam = np.asarray(global_orient[0], dtype=np.float64)
                     hand_side = 'right' if int(is_right) == 1 else 'left'
-                    ts = {
-                        'frame_idx': int(frame_idx),
-                        'image_stem': img_fn,
-                    }
-                    if args.assume_fps is not None:
-                        ts['timestamp_sec'] = float(frame_idx) / float(args.assume_fps)
-
-                    p_wrist_base = R_wrist_base = None
+                    
+                    # Convert to IsaacLab-compatible format with wrist in device/base frame
+                    p_wrist_base = p_wrist_cam.copy()
+                    R_wrist_base = R_wrist_cam.copy()
                     if T_cam2base is not None:
                         p_wrist_base, R_wrist_base = _wrist_pose_cam_to_base(
                             p_wrist_cam, R_wrist_cam, T_cam2base
                         )
-
+                    
+                    # keypoints_3d_local: OpenPose 21 keypoints in wrist-local frame
+                    keypoints_3d_local = keypoints_3d.tolist()
+                    
+                    # Build minimal IsaacLab-compatible record
                     record = {
                         'frame_idx': int(frame_idx),
-                        'img_fn': img_fn,
-                        'image_path': str(img_path),
-                        'person_id': int(person_id),
-                        'is_right': int(is_right),
                         'hand_side': hand_side,
-                        'timestamp': ts,
-                        # Wrist pose in camera frame (meters / HaMeR weak-perspective scale); R from MANO global_orient.
-                        'p_wrist': p_wrist_cam.tolist(),
-                        'R_wrist': R_wrist_cam.tolist(),
-                        'score': person_score,
-                        'bbox_xyxy': bbox_xyxy,
-                        'hand_keypoints_2d': keypoints_2d,
-                        'img_width': int(round(img_w)),
-                        'img_height': int(round(img_h)),
-                        'focal_length_px': [fx, fy],
-                        'camera_center_px': [cx, cy],
-                        'camera_K': [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-                        'focal_for_cam_t': focal_for_cam_t,
-                        'focal_default_demo': default_focal,
-                        'pred_cam': out['pred_cam'][n].detach().cpu().numpy().tolist(),
-                        'pred_cam_t': out['pred_cam_t'][n].detach().cpu().numpy().tolist(),
-                        'pred_cam_t_full': cam_t.tolist(),
-                        'global_orient': global_orient.tolist(),
-                        'hand_pose': hand_pose.tolist(),
-                        'betas': betas.tolist(),
-                        'keypoints_3d_local': keypoints_3d.tolist(),
-                        'keypoints_3d_cam': keypoints_3d_cam.tolist(),
-                        'vertices_local': verts.tolist(),
-                        'vertices_cam': verts_cam.tolist(),
+                        'score': person_score if person_score is not None else 1.0,
+                        'p_wrist_base': p_wrist_base.tolist(),
+                        'R_wrist_base': R_wrist_base.tolist(),
+                        'keypoints_3d_local': keypoints_3d_local,
                     }
-                    if p_wrist_base is not None:
-                        record['p_wrist_base'] = p_wrist_base.tolist()
-                        record['R_wrist_base'] = R_wrist_base.tolist()
-                    if args.structured_debug:
-                        record['keypoints_2d_reprojected'] = keypoints_2d_reprojected.tolist()
-                        record['reprojection_stats'] = reproj_stats
                     structured_results.append(record)
 
                 # Save all meshes to disk
@@ -427,9 +376,11 @@ def main():
 
     if args.save_structured:
         structured_path = os.path.join(args.out_folder, args.structured_file)
+        # Wrap in "frames" key for IsaacLab compatibility (matching HOT3D adapter format)
+        output_data = {'frames': structured_results}
         with open(structured_path, 'w', encoding='utf-8') as f:
-            json.dump(structured_results, f, indent=2)
-        print(f'Saved structured predictions to {structured_path}')
+            json.dump(output_data, f, indent=2)
+        print(f'Saved structured predictions to {structured_path} ({len(structured_results)} frames)')
 
 if __name__ == '__main__':
     main()
